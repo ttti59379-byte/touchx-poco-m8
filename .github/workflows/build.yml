@@ -1,0 +1,44 @@
+name: Build APK
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Unpack zip if needed
+        run: |
+          if [ ! -d app ]; then
+            unzip -oq ./*.zip
+          fi
+          ls -la
+
+      - name: Pack APK
+        run: |
+          cd app
+          zip -X -0 ../unsigned.apk resources.arsc classes.dex classes2.dex classes3.dex
+          zip -X -r ../unsigned.apk AndroidManifest.xml res
+
+      - name: Align and sign
+        run: |
+          BT=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -1)
+          $BT/zipalign -p -f 4 unsigned.apk aligned.apk
+          $BT/apksigner sign \
+            --ks touchx.keystore --ks-key-alias touchx \
+            --ks-pass pass:touchx123 --key-pass pass:touchx123 \
+            --out TouchX_POCO_M8.apk aligned.apk
+          $BT/apksigner verify --verbose TouchX_POCO_M8.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TouchX_POCO_M8
+          path: TouchX_POCO_M8.apk
