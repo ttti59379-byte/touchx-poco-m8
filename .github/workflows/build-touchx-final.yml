@@ -1,0 +1,107 @@
+
+name: Build TouchX 10x APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Show repository files
+        run: |
+          echo "Repository contents:"
+          ls -lah
+          echo "Workflow files:"
+          find .github/workflows -maxdepth 1 -type f
+
+      - name: Find project archive
+        run: |
+          ARCHIVE=$(find . -maxdepth 2 -type f \
+            -iname 'TouchX_10x_repo.zip.zip' | head -n 1)
+
+          if [ -z "$ARCHIVE" ]; then
+            echo "Project archive not found!"
+            find . -maxdepth 3 -type f
+            exit 1
+          fi
+
+          echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
+          echo "Found: $ARCHIVE"
+
+      - name: Extract project
+        run: |
+          mkdir -p extracted
+          unzip -q "$ARCHIVE" -d extracted
+          echo "Extracted files:"
+          find extracted -maxdepth 4 -type f | head -n 150
+
+      - name: Locate Gradle wrapper
+        run: |
+          GRADLEW=$(find extracted -type f \
+            -name gradlew | head -n 1)
+
+          if [ -z "$GRADLEW" ]; then
+            echo "ERROR: gradlew not found!"
+            echo "Checking Gradle build files:"
+            find extracted -type f \
+              \( -name 'build.gradle' \
+              -o -name 'build.gradle.kts' \
+              -o -name 'settings.gradle' \
+              -o -name 'settings.gradle.kts' \)
+            exit 1
+          fi
+
+          PROJECT_DIR=$(dirname "$GRADLEW")
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+
+          chmod +x "$GRADLEW"
+
+          echo "Gradle project found: $PROJECT_DIR"
+
+      - name: Build debug APK
+        run: |
+          cd "$PROJECT_DIR"
+          ./gradlew assembleDebug --no-daemon --stacktrace
+
+      - name: Collect APK
+        run: |
+          mkdir -p output
+
+          find "$PROJECT_DIR" -type f \
+            -path '*/build/outputs/apk/*' \
+            -name '*.apk' \
+            -exec cp {} output/ \;
+
+          if [ -z "$(ls -A output)" ]; then
+            echo "ERROR: No APK generated!"
+            exit 1
+          fi
+
+          echo "Generated APK files:"
+          ls -lh output
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: TouchX-10x-APK
+          path: output/*.apk
+          if-no-files-found: error
+          retention-days: 7
+          
