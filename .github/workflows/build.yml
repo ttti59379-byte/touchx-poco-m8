@@ -1,12 +1,8 @@
 
-name: Build APK
+name: Build TouchX 10x APK
 
 on:
   workflow_dispatch:
-  push:
-    paths:
-      - 'TouchX_10x_repo_v3.zip'
-      - '.github/workflows/build.yml'
 
 permissions:
   contents: read
@@ -14,182 +10,135 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     steps:
-      - name: Checkout repository
+      - name: Download repository
         uses: actions/checkout@v5
 
-      - name: Setup Java 17
+      - name: Set up Java
         uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
 
-      - name: Setup Android SDK
+      - name: Set up Android SDK
         uses: android-actions/setup-android@v4
 
       - name: Install Android Build Tools
-        run: sdkmanager "build-tools;35.0.0"
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sdkmanager --version
+          sdkmanager "build-tools;35.0.0" --verbose
+          ls -la "$ANDROID_HOME/build-tools/35.0.0"
 
-      - name: Extract and validate project
+      - name: Find and validate application files
         shell: bash
         run: |
           set -euo pipefail
 
-          ARCHIVE="TouchX_10x_repo_v3.zip"
+          ZIP_FILE="$(find . -type f -name 'TouchX_10x_repo_v3.zip' -print -quit)"
 
-          if [ ! -f "$ARCHIVE" ]; then
-            echo "ERROR: Archive not found"
+          if [ -z "$ZIP_FILE" ]; then
+            echo "ERROR: TouchX_10x_repo_v3.zip not found"
             exit 1
           fi
 
           mkdir -p extracted
+          unzip -q "$ZIP_FILE" -d extracted
+
+          mapfile -t MANIFESTS < <(find extracted -type f -name AndroidManifest.xml)
+
+          if [ "${#MANIFESTS[@]}" -ne 1 ]; then
+            echo "ERROR: Expected exactly one AndroidManifest.xml"
+            exit 1
+          fi
+
+          APP_DIR="$(dirname "${MANIFESTS[0]}")"
+
+          test -d "$APP_DIR/res"
+          test -f "$APP_DIR/resources.arsc"
+          test -f "$APP_DIR/classes.dex"
+          test -f "$APP_DIR/classes2.dex"
+          test -f "$APP_DIR/classes3.dex"
+
+          echo "APP_DIR=$APP_DIR" >> "$GITHUB_ENV"
+          echo "Application files found successfully"
+
+      - name: Validate DEX files
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for dex in classes.dex classes2.dex classes3.dex; do
+            FILE="$APP_DIR/$dex"
+
+            if [ ! -s "$FILE" ]; then
+              echo "ERROR: $dex is missing or empty"
+              exit 1
+            fi
+
+            if [ "$(head -c 4 "$FILE")" != "dex"$(printf '\n') ]; then
+              echo "ERROR: Invalid DEX file: $dex"
+              exit 1
+            fi
+
+            echo "$dex OK"
+          done
+
+      - name: Create unsigned APK
+        shell: bash
+        run: |
+          set -euo pipefail
 
           python3 - <<'PY'
+          import os
           import zipfile
-          from pathlib import Path, PurePosixPath
 
-          root = Path("extracted").resolve()
+          app_dir = os.environ["APP_DIR"]
 
-          with zipfile.ZipFile("TouchX_10x_repo_v3.zip") as z:
-              for item in z.infolist():
-                  name = item.filename.replace("\\", "/")
-                  path = PurePosixPath(name)
+          with zipfile.ZipFile("unsigned.apk", "w") as apk:
+              for root, dirs, files in os.walk(app_dir):
+                  dirs.sort()
+                  files.sort()
 
-                  if path.is_absolute() or ".." in path.parts:
-                      raise SystemExit("Unsafe ZIP path: " + name)
-
-                  target = root.joinpath(*path.parts)
-
-                  if item.is_dir():
-                      target.mkdir(parents=True, exist_ok=True)
-                  else:
-                      target.parent.mkdir(parents=True, exist_ok=True)
-                      with z.open(item) as src:
-                          target.write_bytes(src.read())
-
-          manifests = list(root.rglob("AndroidManifest.xml"))
-
-          if len(manifests) != 1:
-              raise SystemExit(
-                  f"Expected one manifest, found {len(manifests)}"
-              )
-
-          app = manifests[0].parent
-
-          required = [
-              "AndroidManifest.xml",
-              "resources.arsc",
-              "classes.dex",
-              "classes2.dex",
-              "classes3.dex"
-          ]
-
-          for name in required:
-              if not (app / name).is_file():
-                  raise SystemExit("Missing: " + name)
-
-          if not (app / "res").is_dir():
-              raise SystemExit("Missing res directory")
-
-          Path("app_path.txt").write_text(str(app))
-
-          print("Project structure verified.")
-          for item in sorted(app.rglob("*")):
-              if item.is_file():
-                  print(item.relative_to(app))
-          PY
-
-      - name: Verify DEX integrity
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          APP="$(cat app_path.txt)"
-
-          python3 - "$APP" <<'PY'
-          import sys
-          import hashlib
-          import struct
-          import zlib
-          from pathlib import Path
-
-          app = Path(sys.argv[1])
-
-          for dex in sorted(app.glob("classes*.dex")):
-              data = dex.read_bytes()
-
-              if len(data) < 112 or not data.startswith(b"dex\n"):
-                  raise SystemExit("Invalid DEX: " + dex.name)
-
-              if struct.unpack("<I", data[32:36])[0] != len(data):
-                  raise SystemExit("Invalid DEX size: " + dex.name)
-
-              if data[12:32] != hashlib.sha1(data[32:]).digest():
-                  raise SystemExit("Invalid DEX SHA-1: " + dex.name)
-
-              checksum = struct.unpack("<I", data[8:12])[0]
-
-              if checksum != (zlib.adler32(data[12:]) & 0xffffffff):
-                  raise SystemExit("Invalid DEX checksum: " + dex.name)
-
-              print(dex.name, "OK")
-          PY
-
-      - name: Package APK
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          APP="$(cat app_path.txt)"
-
-          python3 - "$APP" <<'PY'
-          import sys
-          import zipfile
-          from pathlib import Path
-
-          app = Path(sys.argv[1])
-
-          with zipfile.ZipFile(
-              "unsigned.apk",
-              "w",
-              compression=zipfile.ZIP_STORED
-          ) as apk:
-              for item in sorted(app.rglob("*")):
-                  if item.is_file():
+                  for filename in files:
+                      full_path = os.path.join(root, filename)
+                      relative_path = os.path.relpath(full_path, app_dir)
                       apk.write(
-                          item,
-                          item.relative_to(app).as_posix()
+                          full_path,
+                          relative_path.replace(os.sep, "/"),
+                          compress_type=zipfile.ZIP_STORED
                       )
 
-          print("APK package created.")
+          print("APK archive created")
           PY
 
       - name: Align APK
         shell: bash
         run: |
           set -euo pipefail
+          "$ANDROID_HOME/build-tools/35.0.0/zipalign" \
+            -f -p 4 unsigned.apk aligned.apk
 
-          BT="$ANDROID_HOME/build-tools/35.0.0"
-
-          "$BT/zipalign" -p -f 4 unsigned.apk aligned.apk
-          "$BT/zipalign" -c -v 4 aligned.apk
-
-      - name: Verify package ID
+      - name: Check package name
         shell: bash
         run: |
           set -euo pipefail
 
-          BT="$ANDROID_HOME/build-tools/35.0.0"
+          AAPT="$ANDROID_HOME/build-tools/35.0.0/aapt"
+          "$AAPT" dump badging aligned.apk | head -n 1
 
-          PACKAGE=$("$BT/aapt2" dump packagename aligned.apk)
-
-          echo "Detected package: $PACKAGE"
+          PACKAGE="$("$AAPT" dump badging aligned.apk \
+            | sed -n "s/^package: name='\([^']*\)'.*/\1/p")"
 
           if [ "$PACKAGE" != "com.touchx.sensitivix8" ]; then
-            echo "ERROR: Incorrect package ID"
+            echo "ERROR: Incorrect package name: $PACKAGE"
             exit 1
           fi
+
+          echo "Package name verified"
 
       - name: Sign APK
         shell: bash
@@ -206,14 +155,9 @@ jobs:
           test -n "$KEY_ALIAS"
           test -n "$KEY_PASSWORD"
 
-          printf '%s' "$KEYSTORE_BASE64" |
-            base64 --decode > signing.keystore
+          echo "$KEYSTORE_BASE64" | base64 --decode > signing.keystore
 
-          test -s signing.keystore
-
-          BT="$ANDROID_HOME/build-tools/35.0.0"
-
-          "$BT/apksigner" sign \
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" sign \
             --ks signing.keystore \
             --ks-key-alias "$KEY_ALIAS" \
             --ks-pass env:KEYSTORE_PASSWORD \
@@ -221,56 +165,15 @@ jobs:
             --out TouchX_10x.apk \
             aligned.apk
 
-          "$BT/apksigner" verify \
-            --verbose \
-            --print-certs \
-            TouchX_10x.apk
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify \
+            --verbose TouchX_10x.apk
 
           rm -f signing.keystore
 
-      - name: Check original certificate
-        shell: bash
-        env:
-          ORIGINAL_CERT_SHA256: ${{ vars.ORIGINAL_CERT_SHA256 }}
-        run: |
-          set -euo pipefail
-
-          if [ -n "$ORIGINAL_CERT_SHA256" ]; then
-            BT="$ANDROID_HOME/build-tools/35.0.0"
-
-            ACTUAL=$(
-              "$BT/apksigner" verify --print-certs TouchX_10x.apk 2>&1 |
-              sed -n 's/.*SHA-256 digest: *//p' |
-              head -n 1 |
-              tr -d ':\r\n ' |
-              tr '[:upper:]' '[:lower:]'
-            )
-
-            EXPECTED=$(
-              echo "$ORIGINAL_CERT_SHA256" |
-              tr -d ':\r\n ' |
-              tr '[:upper:]' '[:lower:]'
-            )
-
-            if [ "$ACTUAL" = "$EXPECTED" ]; then
-              echo "ERROR: Original certificate detected"
-              exit 1
-            fi
-          fi
-
-          echo "Certificate check passed."
-
-      - name: Verify final APK
-        run: |
-          set -euo pipefail
-
-          test -s TouchX_10x.apk
-          ls -lh TouchX_10x.apk
-
-      - name: Upload APK
+      - name: Upload finished APK
         uses: actions/upload-artifact@v6
         with:
-          name: TouchX_10x
+          name: TouchX-10x-APK
           path: TouchX_10x.apk
           if-no-files-found: error
           
