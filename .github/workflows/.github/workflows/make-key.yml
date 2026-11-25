@@ -1,0 +1,58 @@
+name: Make signing key (one-time)
+
+# Разовый запуск: создаёт ключ подписи и случайные пароли.
+# Результат - файл GitHub_Secrets.txt во вкладке Artifacts (хранится 1 день).
+# Работает только в ПРИВАТНОМ репозитории. После использования удалите этот файл.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  make-key:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Only for private repositories
+        env:
+          IS_PRIVATE: ${{ github.event.repository.private }}
+        run: |
+          if [ "$IS_PRIVATE" != "true" ]; then
+            echo "::error::Репозиторий публичный. Сделайте его Private (Settings -> General -> Danger Zone -> Change visibility), иначе ключ могут скачать посторонние."
+            exit 1
+          fi
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Generate key
+        run: |
+          set -euo pipefail
+          mkdir -p key
+          PASS=$(openssl rand -hex 20)
+          keytool -genkeypair \
+            -keystore key/release.keystore -storetype PKCS12 \
+            -storepass "$PASS" -keypass "$PASS" \
+            -alias touchx -keyalg RSA -keysize 2048 -validity 36500 \
+            -dname "CN=TouchX 10x, O=TouchX"
+          {
+            echo "KEY_ALIAS=touchx"
+            echo
+            echo "KEYSTORE_PASSWORD=$PASS"
+            echo
+            echo "KEY_PASSWORD=$PASS"
+            echo
+            echo "KEYSTORE_BASE64=$(base64 -w0 key/release.keystore)"
+          } > key/GitHub_Secrets.txt
+          rm key/release.keystore
+          echo "Готово. Файл GitHub_Secrets.txt лежит в Artifacts этого запуска."
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: signing-secrets
+          path: key/GitHub_Secrets.txt
+          retention-days: 1
+          if-no-files-found: error
