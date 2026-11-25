@@ -17,15 +17,21 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
 
       - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
 
       - name: Install Android Build Tools
         run: sdkmanager "build-tools;35.0.0"
 
-      - name: Extract project
+      - name: Extract and validate project
         shell: bash
         run: |
           set -euo pipefail
@@ -33,11 +39,11 @@ jobs:
           ARCHIVE="TouchX_10x_repo_v3.zip"
 
           if [ ! -f "$ARCHIVE" ]; then
-            echo "ERROR: Archive not found: $ARCHIVE"
+            echo "ERROR: Archive not found"
             exit 1
           fi
 
-          mkdir extracted
+          mkdir -p extracted
 
           python3 - <<'PY'
           import zipfile
@@ -45,8 +51,8 @@ jobs:
 
           root = Path("extracted").resolve()
 
-          with zipfile.ZipFile("TouchX_10x_repo_v3.zip") as archive:
-              for item in archive.infolist():
+          with zipfile.ZipFile("TouchX_10x_repo_v3.zip") as z:
+              for item in z.infolist():
                   name = item.filename.replace("\\", "/")
                   path = PurePosixPath(name)
 
@@ -59,7 +65,7 @@ jobs:
                       target.mkdir(parents=True, exist_ok=True)
                   else:
                       target.parent.mkdir(parents=True, exist_ok=True)
-                      with archive.open(item) as src:
+                      with z.open(item) as src:
                           target.write_bytes(src.read())
 
           manifests = list(root.rglob("AndroidManifest.xml"))
@@ -86,13 +92,12 @@ jobs:
           if not (app / "res").is_dir():
               raise SystemExit("Missing res directory")
 
-          print("APK files found:")
+          Path("app_path.txt").write_text(str(app))
+
+          print("Project structure verified.")
           for item in sorted(app.rglob("*")):
               if item.is_file():
                   print(item.relative_to(app))
-
-          with open("app_path.txt", "w") as f:
-              f.write(str(app))
           PY
 
       - name: Verify DEX integrity
@@ -124,6 +129,7 @@ jobs:
                   raise SystemExit("Invalid DEX SHA-1: " + dex.name)
 
               checksum = struct.unpack("<I", data[8:12])[0]
+
               if checksum != (zlib.adler32(data[12:]) & 0xffffffff):
                   raise SystemExit("Invalid DEX checksum: " + dex.name)
 
@@ -156,7 +162,7 @@ jobs:
                           item.relative_to(app).as_posix()
                       )
 
-          print("APK package created")
+          print("APK package created.")
           PY
 
       - name: Align APK
@@ -178,7 +184,7 @@ jobs:
 
           PACKAGE=$("$BT/aapt2" dump packagename aligned.apk)
 
-          echo "Package: $PACKAGE"
+          echo "Detected package: $PACKAGE"
 
           if [ "$PACKAGE" != "com.touchx.sensitivix8" ]; then
             echo "ERROR: Incorrect package ID"
@@ -203,6 +209,8 @@ jobs:
           printf '%s' "$KEYSTORE_BASE64" |
             base64 --decode > signing.keystore
 
+          test -s signing.keystore
+
           BT="$ANDROID_HOME/build-tools/35.0.0"
 
           "$BT/apksigner" sign \
@@ -213,21 +221,54 @@ jobs:
             --out TouchX_10x.apk \
             aligned.apk
 
-          "$BT/apksigner" verify --verbose TouchX_10x.apk
+          "$BT/apksigner" verify \
+            --verbose \
+            --print-certs \
+            TouchX_10x.apk
 
           rm -f signing.keystore
 
-      - name: Check output
+      - name: Check original certificate
+        shell: bash
+        env:
+          ORIGINAL_CERT_SHA256: ${{ vars.ORIGINAL_CERT_SHA256 }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "$ORIGINAL_CERT_SHA256" ]; then
+            BT="$ANDROID_HOME/build-tools/35.0.0"
+
+            ACTUAL=$(
+              "$BT/apksigner" verify --print-certs TouchX_10x.apk 2>&1 |
+              sed -n 's/.*SHA-256 digest: *//p' |
+              head -n 1 |
+              tr -d ':\r\n ' |
+              tr '[:upper:]' '[:lower:]'
+            )
+
+            EXPECTED=$(
+              echo "$ORIGINAL_CERT_SHA256" |
+              tr -d ':\r\n ' |
+              tr '[:upper:]' '[:lower:]'
+            )
+
+            if [ "$ACTUAL" = "$EXPECTED" ]; then
+              echo "ERROR: Original certificate detected"
+              exit 1
+            fi
+          fi
+
+          echo "Certificate check passed."
+
+      - name: Verify final APK
         run: |
           set -euo pipefail
 
           test -s TouchX_10x.apk
-
-          echo "Final APK:"
           ls -lh TouchX_10x.apk
 
       - name: Upload APK
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: TouchX_10x
           path: TouchX_10x.apk
