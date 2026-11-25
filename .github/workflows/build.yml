@@ -16,7 +16,7 @@ jobs:
     timeout-minutes: 25
 
     steps:
-      - name: Download repository
+      - name: Checkout repository
         uses: actions/checkout@v5
 
       - name: Set up Java
@@ -25,33 +25,53 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v4
-
-      - name: Accept licenses and install tools
+      - name: Find preinstalled Android Build Tools
         shell: bash
         run: |
           set -euo pipefail
-          yes | sdkmanager --licenses || true
-          sdkmanager --install "build-tools;35.0.0"
-          ls -la "$ANDROID_HOME/build-tools/35.0.0"
+
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+
+          if [ -z "$SDK" ] || [ ! -d "$SDK/build-tools" ]; then
+            echo "ERROR: Android SDK Build Tools not found"
+            exit 1
+          fi
+
+          BUILD_TOOLS="$(find "$SDK/build-tools" \
+            -mindepth 1 -maxdepth 1 -type d \
+            | sort -V | tail -n 1)"
+
+          if [ -z "$BUILD_TOOLS" ]; then
+            echo "ERROR: No Build Tools installed"
+            exit 1
+          fi
+
+          for tool in aapt zipalign apksigner; do
+            test -x "$BUILD_TOOLS/$tool"
+          done
+
+          echo "BUILD_TOOLS=$BUILD_TOOLS" >> "$GITHUB_ENV"
+          echo "Using: $BUILD_TOOLS"
 
       - name: Find and validate application files
         shell: bash
         run: |
           set -euo pipefail
 
-          ZIP_FILE="$(find . -type f -name 'TouchX_10x_repo_v3.zip' -print -quit)"
+          ZIP_FILE="$(find . -type f \
+            -name 'TouchX_10x_repo_v3.zip' -print -quit)"
 
           if [ -z "$ZIP_FILE" ]; then
-            echo "ERROR: TouchX_10x_repo_v3.zip not found"
+            echo "ERROR: TouchX ZIP not found"
             exit 1
           fi
 
           mkdir -p extracted
           unzip -q "$ZIP_FILE" -d extracted
 
-          mapfile -t MANIFESTS < <(find extracted -type f -name AndroidManifest.xml)
+          mapfile -t MANIFESTS < <(
+            find extracted -type f -name AndroidManifest.xml
+          )
 
           if [ "${#MANIFESTS[@]}" -ne 1 ]; then
             echo "ERROR: Expected exactly one AndroidManifest.xml"
@@ -62,9 +82,9 @@ jobs:
 
           test -d "$APP_DIR/res"
           test -f "$APP_DIR/resources.arsc"
-          test -f "$APP_DIR/classes.dex"
-          test -f "$APP_DIR/classes2.dex"
-          test -f "$APP_DIR/classes3.dex"
+          test -s "$APP_DIR/classes.dex"
+          test -s "$APP_DIR/classes2.dex"
+          test -s "$APP_DIR/classes3.dex"
 
           echo "APP_DIR=$APP_DIR" >> "$GITHUB_ENV"
           echo "Application files found"
@@ -76,7 +96,6 @@ jobs:
 
           for dex in classes.dex classes2.dex classes3.dex; do
             FILE="$APP_DIR/$dex"
-            test -s "$FILE"
 
             if [ "$(head -c 3 "$FILE")" != "dex" ]; then
               echo "ERROR: Invalid DEX file: $dex"
@@ -105,6 +124,7 @@ jobs:
                   for filename in files:
                       full_path = os.path.join(root, filename)
                       relative_path = os.path.relpath(full_path, app_dir)
+
                       apk.write(
                           full_path,
                           relative_path.replace(os.sep, "/"),
@@ -118,17 +138,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          "$ANDROID_HOME/build-tools/35.0.0/zipalign" \
-            -f -p 4 unsigned.apk aligned.apk
+          "$BUILD_TOOLS/zipalign" -f -p 4 unsigned.apk aligned.apk
 
-      - name: Check package name
+      - name: Verify package name
         shell: bash
         run: |
           set -euo pipefail
 
-          AAPT="$ANDROID_HOME/build-tools/35.0.0/aapt"
-
-          PACKAGE="$("$AAPT" dump badging aligned.apk \
+          PACKAGE="$("$BUILD_TOOLS/aapt" dump badging aligned.apk \
             | sed -n "s/^package: name='\([^']*\)'.*/\1/p")"
 
           echo "Detected package: $PACKAGE"
@@ -155,7 +172,7 @@ jobs:
 
           echo "$KEYSTORE_BASE64" | base64 --decode > signing.keystore
 
-          "$ANDROID_HOME/build-tools/35.0.0/apksigner" sign \
+          "$BUILD_TOOLS/apksigner" sign \
             --ks signing.keystore \
             --ks-key-alias "$KEY_ALIAS" \
             --ks-pass env:KEYSTORE_PASSWORD \
@@ -163,12 +180,11 @@ jobs:
             --out TouchX_10x.apk \
             aligned.apk
 
-          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify \
-            --verbose TouchX_10x.apk
+          "$BUILD_TOOLS/apksigner" verify --verbose TouchX_10x.apk
 
           rm -f signing.keystore
 
-      - name: Upload finished APK
+      - name: Upload APK
         uses: actions/upload-artifact@v6
         with:
           name: TouchX-10x-APK
