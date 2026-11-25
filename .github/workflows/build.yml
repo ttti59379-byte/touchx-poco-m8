@@ -13,7 +13,7 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
 
     steps:
       - name: Download repository
@@ -28,21 +28,23 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v4
 
-      - name: Install Android Build Tools
+      - name: Accept licenses and install tools
         shell: bash
         run: |
-          set -euxo pipefail
-          sdkmanager --version
-          sdkmanager "build-tools;35.0.0" --verbose
+          set -euo pipefail
+          yes | sdkmanager --licenses || true
+          sdkmanager --install "build-tools;35.0.0"
           ls -la "$ANDROID_HOME/build-tools/35.0.0"
 
       - name: Find and validate application files
         shell: bash
         run: |
           set -euo pipefail
+
           ZIP_FILE="$(find . -type f -name 'TouchX_10x_repo_v3.zip' -print -quit)"
+
           if [ -z "$ZIP_FILE" ]; then
-            echo "ERROR: ZIP archive not found"
+            echo "ERROR: TouchX_10x_repo_v3.zip not found"
             exit 1
           fi
 
@@ -50,12 +52,14 @@ jobs:
           unzip -q "$ZIP_FILE" -d extracted
 
           mapfile -t MANIFESTS < <(find extracted -type f -name AndroidManifest.xml)
+
           if [ "${#MANIFESTS[@]}" -ne 1 ]; then
             echo "ERROR: Expected exactly one AndroidManifest.xml"
             exit 1
           fi
 
           APP_DIR="$(dirname "${MANIFESTS[0]}")"
+
           test -d "$APP_DIR/res"
           test -f "$APP_DIR/resources.arsc"
           test -f "$APP_DIR/classes.dex"
@@ -63,18 +67,22 @@ jobs:
           test -f "$APP_DIR/classes3.dex"
 
           echo "APP_DIR=$APP_DIR" >> "$GITHUB_ENV"
+          echo "Application files found"
 
       - name: Validate DEX files
         shell: bash
         run: |
           set -euo pipefail
+
           for dex in classes.dex classes2.dex classes3.dex; do
             FILE="$APP_DIR/$dex"
             test -s "$FILE"
+
             if [ "$(head -c 3 "$FILE")" != "dex" ]; then
               echo "ERROR: Invalid DEX file: $dex"
               exit 1
             fi
+
             echo "$dex OK"
           done
 
@@ -82,34 +90,51 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           python3 - <<'PY'
           import os
           import zipfile
 
           app_dir = os.environ["APP_DIR"]
+
           with zipfile.ZipFile("unsigned.apk", "w") as apk:
               for root, dirs, files in os.walk(app_dir):
                   dirs.sort()
                   files.sort()
+
                   for filename in files:
                       full_path = os.path.join(root, filename)
                       relative_path = os.path.relpath(full_path, app_dir)
-                      apk.write(full_path, relative_path.replace(os.sep, "/"),
-                                compress_type=zipfile.ZIP_STORED)
+                      apk.write(
+                          full_path,
+                          relative_path.replace(os.sep, "/"),
+                          compress_type=zipfile.ZIP_STORED
+                      )
+
+          print("Unsigned APK created")
           PY
 
       - name: Align APK
+        shell: bash
         run: |
-          "$ANDROID_HOME/build-tools/35.0.0/zipalign" -f -p 4 unsigned.apk aligned.apk
+          set -euo pipefail
+          "$ANDROID_HOME/build-tools/35.0.0/zipalign" \
+            -f -p 4 unsigned.apk aligned.apk
 
       - name: Check package name
         shell: bash
         run: |
           set -euo pipefail
+
           AAPT="$ANDROID_HOME/build-tools/35.0.0/aapt"
-          PACKAGE="$("$AAPT" dump badging aligned.apk | sed -n "s/^package: name='\([^']*\)'.*/\1/p")"
+
+          PACKAGE="$("$AAPT" dump badging aligned.apk \
+            | sed -n "s/^package: name='\([^']*\)'.*/\1/p")"
+
+          echo "Detected package: $PACKAGE"
+
           if [ "$PACKAGE" != "com.touchx.sensitivix8" ]; then
-            echo "ERROR: Incorrect package name: $PACKAGE"
+            echo "ERROR: Incorrect package name"
             exit 1
           fi
 
@@ -122,6 +147,7 @@ jobs:
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
           set -euo pipefail
+
           test -n "$KEYSTORE_BASE64"
           test -n "$KEYSTORE_PASSWORD"
           test -n "$KEY_ALIAS"
@@ -134,9 +160,12 @@ jobs:
             --ks-key-alias "$KEY_ALIAS" \
             --ks-pass env:KEYSTORE_PASSWORD \
             --key-pass env:KEY_PASSWORD \
-            --out TouchX_10x.apk aligned.apk
+            --out TouchX_10x.apk \
+            aligned.apk
 
-          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose TouchX_10x.apk
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify \
+            --verbose TouchX_10x.apk
+
           rm -f signing.keystore
 
       - name: Upload finished APK
